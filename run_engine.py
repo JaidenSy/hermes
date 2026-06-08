@@ -26,6 +26,7 @@ TASKS_DIR = Path.home() / "raphael" / "tasks"
 STEP_POLL_INTERVAL_S = 5  # poll raphael task JSON every 5 seconds
 STEP_TIMEOUT_S = 3600  # 60-min hard timeout per step
 RUN_FILE_LOCK_TIMEOUT_S = 5  # max wait to acquire file lock
+RUNS_RETENTION_DAYS = 7  # delete terminal runs older than this many days
 
 log = logging.getLogger("hermes")
 
@@ -74,6 +75,7 @@ class RunEngine:
     def __init__(self):
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         self._recover_stale_runs()
+        self._cleanup_old_runs()
         log.debug("RunEngine initialised — RUNS_DIR: %s", RUNS_DIR)
 
     # ------------------------------------------------------------------
@@ -109,6 +111,7 @@ class RunEngine:
                 "completed_at": None,
                 "output_path": None,
                 "parallel_group": step.parallel_group,
+                "retry_count": 0,
             }
             for step in result.pipeline
         ]
@@ -279,6 +282,27 @@ class RunEngine:
             reason,
         )
 
+    def reset_step_for_retry(self, run_id: str, step_index: int) -> None:
+        """
+        Resets a failed/timed-out step back to pending so the caller can
+        re-dispatch it.  Increments retry_count so the caller can enforce
+        a retry cap.  Does NOT change run-level status.
+        """
+        run = self.get_run(run_id)
+        step = run["pipeline"][step_index]
+        step["retry_count"] = step.get("retry_count", 0) + 1
+        step["status"] = "pending"
+        step["task_id"] = None
+        step["started_at"] = None
+        self._write_run(run_id, run)
+        log.info(
+            "Step %d reset for retry (attempt %d) — run=%s role=%s",
+            step_index,
+            step["retry_count"],
+            run_id,
+            step.get("role"),
+        )
+
     def get_active_run(self) -> Optional[dict]:
         """
         Scans RUNS_DIR for a run with status=running.
@@ -407,6 +431,29 @@ class RunEngine:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _cleanup_old_runs(self) -> None:
+        """Delete terminal run files (done/failed/aborted) older than RUNS_RETENTION_DAYS."""
+        cutoff = datetime.now(timezone.utc).timestamp() - RUNS_RETENTION_DAYS * 86400
+        deleted = 0
+        for path in RUNS_DIR.glob("*.json"):
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                data = json.loads(path.read_text())
+                if data.get("status") not in ("done", "failed", "aborted"):
+                    continue
+                path.unlink()
+                deleted += 1
+                log.debug("Cleanup: deleted old run %s (%s)", data.get("id"), path.name)
+            except Exception:
+                pass
+        if deleted:
+            log.info(
+                "Cleanup: deleted %d run file(s) older than %d days",
+                deleted,
+                RUNS_RETENTION_DAYS,
+            )
 
     def _recover_stale_runs(self) -> None:
         """
