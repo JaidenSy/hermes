@@ -22,9 +22,13 @@ from email.mime.text import MIMEText
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-from planner import classify_task, PlannerResult
+from planner import classify_task, urgent_result  # noqa: F401
+from planner import PlannerResult
 from run_engine import RunEngine
 from agent_runner import AgentRunner
+
+DEDUP_WINDOW_SECONDS = 60
+URGENT_PREFIX = "[URGENT]"
 
 CONFIG_PATH = Path.home() / "hermes" / "config" / "config.yaml"
 LOG_PATH = Path.home() / "hermes" / "logs" / "hermes.log"
@@ -177,6 +181,37 @@ def run_task(task: str, session_name: str = None) -> str:
 # ---------------------------------------------------------------------------
 # Pipeline orchestration helpers
 # ---------------------------------------------------------------------------
+
+RAPHBRAIN_DAILY_DIR = Path.home() / "Documents" / "RaphBrain" / "Daily"
+
+
+def _append_pipeline_to_daily_note(
+    project: str, branch: str, final_status: str, duration: str, failed_step: str = ""
+) -> None:
+    """Append a one-liner pipeline result to today's RaphBrain daily note."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        daily_path = RAPHBRAIN_DAILY_DIR / f"{today}.md"
+
+        if final_status == "done":
+            line = f"\n- ✅ Hermes: `{project}/{branch}` done in {duration}"
+        elif final_status == "failed":
+            line = f"\n- ❌ Hermes: `{project}` failed at `{failed_step}` ({duration})"
+        elif final_status == "aborted":
+            line = f"\n- 🛑 Hermes: `{project}/{branch}` aborted ({duration})"
+        else:
+            return  # don't log unknown states
+
+        if daily_path.exists():
+            with daily_path.open("a") as f:
+                f.write(line)
+        else:
+            daily_path.parent.mkdir(parents=True, exist_ok=True)
+            daily_path.write_text(f"# {today}\n{line}\n")
+
+        log.info(f"[daily-note] Appended pipeline result to {daily_path.name}")
+    except Exception as exc:
+        log.warning(f"[daily-note] Failed to write to daily note: {exc}")
 
 
 def _format_duration(started_iso: str, ended_iso: str) -> str:
@@ -455,6 +490,16 @@ def _run_pipeline(
             )
 
         _send_reply(hermes_config, completion_msg)
+
+        # Append one-liner to today's RaphBrain daily note
+        failed_step = ""
+        if final_status == "failed":
+            failed_step = next(
+                (s["role"] for s in pipeline if s["status"] == "failed"), "unknown"
+            )
+        _append_pipeline_to_daily_note(
+            project, branch, final_status, total_duration, failed_step
+        )
     except Exception as exc:
         log.error(f"[orchestrate] Failed to send completion notification: {exc}")
 
@@ -463,13 +508,36 @@ def orchestrate_task(task_text: str, config: dict) -> str:
     """
     Route an incoming task through the planner.
 
+    - [URGENT] prefix: bypasses plan/review, forces coder → deployer pipeline.
     - Direct tasks (status checks, short queries): forwarded to run_task() synchronously.
     - Pipeline tasks: create a run file, start the engine in a daemon thread,
       return a start-confirmation string immediately (sent as the reply).
 
     config is the loaded config.yaml dict — needed for notification channel.
     """
-    result: PlannerResult = classify_task(task_text)
+    # Abort shortcut — always available regardless of prefix
+    if task_text.strip().lower().startswith("abort"):
+        engine = RunEngine()
+        active = engine.get_active_run()
+        if active:
+            try:
+                engine.abort_run(active["id"])
+                project = active.get("project", "unknown")
+                branch = active.get("branch", "")
+                return f"🛑 Aborted run {active['id']} — {project} / {branch}"
+            except Exception as exc:
+                log.warning(f"[orchestrate] abort_run failed: {exc}")
+                return f"⚠️ Abort failed: {exc}"
+        return "ℹ️ No active run to abort."
+
+    # [URGENT] bypass — skip plan/cleanup/review, go straight to coder → deployer
+    if task_text.strip().upper().startswith(URGENT_PREFIX):
+        task_text = task_text.strip()[len(URGENT_PREFIX) :].strip()
+        log.info(f"[URGENT] bypassing full pipeline: {task_text[:60]!r}")
+        result: PlannerResult = urgent_result(task_text)
+    else:
+        result = classify_task(task_text)
+
     log.info(
         f"[orchestrate] Classified: tier={result.tier} project={result.project!r} "
         f"is_direct={result.is_direct} steps={len(result.pipeline)}"
@@ -561,6 +629,7 @@ class TelegramPoller:
             self.cfg["bot_token_keychain_account"],
         )
         self.offset = self._load_offset()
+        self._dedup: dict[str, float] = {}  # task_text → last-seen timestamp
         log.info(f"Telegram poller ready — chat_id={self.chat_id} offset={self.offset}")
 
     def _load_offset(self) -> int:
@@ -608,6 +677,15 @@ class TelegramPoller:
                     if text.startswith(self.prefix)
                     else text
                 )
+
+                # Deduplication: ignore same task dispatched within DEDUP_WINDOW_SECONDS
+                now_ts = time.time()
+                last_seen = self._dedup.get(task, 0)
+                if now_ts - last_seen < DEDUP_WINDOW_SECONDS:
+                    log.info(f"[dedup] Telegram duplicate ignored: {task[:60]!r}")
+                    continue
+                self._dedup[task] = now_ts
+
                 log.info(f"Telegram task: {task[:80]}...")
                 try:
                     reply = orchestrate_task(task, self.hermes_cfg)
@@ -638,6 +716,7 @@ class iMessagePoller:
         self.prefix = self.cfg.get("trigger_prefix", "[HERMES]")
         self.hermes_cfg = config
         self.last_check = self._load_last_check()
+        self._dedup: dict[str, float] = {}  # task_text → last-seen timestamp
         log.info(
             f"iMessage poller ready (osascript, no FDA) — "
             f"tracking from {self.last_check:%Y-%m-%d %H:%M:%S}"
@@ -710,6 +789,15 @@ return output"""
         tasks = [m.strip() for m in output.split("|||HSEP|||") if m.strip()]
         for text in tasks:
             task = text[len(self.prefix) :].strip()
+
+            # Deduplication: ignore same task dispatched within DEDUP_WINDOW_SECONDS
+            now_ts = time.time()
+            last_seen = self._dedup.get(task, 0)
+            if now_ts - last_seen < DEDUP_WINDOW_SECONDS:
+                log.info(f"[dedup] iMessage duplicate ignored: {task[:60]!r}")
+                continue
+            self._dedup[task] = now_ts
+
             log.info(f"iMessage task: {task[:80]}...")
             reply = orchestrate_task(task, self.hermes_cfg)
             self._reply(reply[:1500])
