@@ -18,6 +18,7 @@ import keyring
 import requests
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from email.mime.text import MIMEText
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -25,6 +26,8 @@ from watchdog.events import FileSystemEventHandler
 from planner import classify_task, PlannerResult
 from run_engine import RunEngine
 from agent_runner import AgentRunner
+from output_validator import validate_step_output
+from scaffold_project import run_scaffold
 
 CONFIG_PATH = Path.home() / "hermes" / "config" / "config.yaml"
 STEP_MAX_RETRIES = 1  # max automatic retries per step (not applicable to rate-limited)
@@ -83,9 +86,7 @@ Be specific and factual. Only include what is supported by the partial output ab
         import json as _json
         import urllib.request as _urllib
 
-        payload = _json.dumps(
-            {"model": "llama3.1:8b", "prompt": prompt, "stream": False}
-        ).encode()
+        payload = _json.dumps({"model": "llama3.1:8b", "prompt": prompt, "stream": False}).encode()
         req = _urllib.Request(
             "http://localhost:11434/api/generate",
             data=payload,
@@ -93,9 +94,7 @@ Be specific and factual. Only include what is supported by the partial output ab
             method="POST",
         )
         with _urllib.urlopen(req, timeout=120) as resp:
-            response_text = (
-                _json.loads(resp.read().decode()).get("response", "").strip()
-            )
+            response_text = _json.loads(resp.read().decode()).get("response", "").strip()
 
         if not response_text:
             log.error("Ollama handoff generation returned empty response")
@@ -121,7 +120,7 @@ Be specific and factual. Only include what is supported by the partial output ab
         return ""
 
 
-def run_task(task: str, session_name: str = None) -> str:
+def run_task(task: str, session_name: Optional[str] = None) -> str:
     """Spawn a tmux session running Claude Code with the given task."""
     if not session_name:
         session_name = f"hermes-{int(time.time())}"
@@ -182,8 +181,7 @@ def run_task(task: str, session_name: str = None) -> str:
             f"Handoff written to: {handoff_path} — resume when Claude Code resets."
         )
     return (
-        f"Task {session_name} timed out after {timeout}s. "
-        f"Check tmux: tmux attach -t {session_name}"
+        f"Task {session_name} timed out after {timeout}s. Check tmux: tmux attach -t {session_name}"
     )
 
 
@@ -220,9 +218,7 @@ def _send_imessage(reply_to: str, message: str) -> None:
     set targetBuddy to buddy "{reply_to}" of targetService
     send "{safe}" to targetBuddy
 end tell"""
-    result = subprocess.run(
-        ["osascript", "-e", script], capture_output=True, text=True, timeout=10
-    )
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
     if result.returncode != 0:
         log.error(f"iMessage send failed: {result.stderr.strip()}")
     else:
@@ -259,9 +255,7 @@ def _send_reply(config: dict, message: str) -> None:
         _send_imessage(reply_to, message)
 
 
-def _run_pipeline(
-    run_id: str, engine: RunEngine, runner: AgentRunner, hermes_config: dict
-) -> None:
+def _run_pipeline(run_id: str, engine: RunEngine, runner: AgentRunner, hermes_config: dict) -> None:
     """
     Background thread: drives a full pipeline run to completion.
 
@@ -276,9 +270,7 @@ def _run_pipeline(
     Completion/failure notification is sent when the last step resolves.
     """
 
-    def _dispatch_one_step(
-        run_id: str, idx: int, step: dict, run_snapshot: dict
-    ) -> None:
+    def _dispatch_one_step(run_id: str, idx: int, step: dict, run_snapshot: dict) -> None:
         """Dispatch a single step, poll to completion, update engine state."""
         role = step["role"]
         try:
@@ -299,10 +291,25 @@ def _run_pipeline(
 
         if final_status in ("done", "needs-review"):
             if final_status == "needs-review":
-                log.warning(
-                    f"[orchestrate] Step {idx} ({role}) needs-review — treating as done"
-                )
+                log.warning(f"[orchestrate] Step {idx} ({role}) needs-review — treating as done")
             output_path = engine._read_task_output_note(task_id)
+
+            # Validate output note schema before advancing the pipeline.
+            if output_path:
+                valid, reason = validate_step_output(role, output_path)
+                if not valid:
+                    log.error(
+                        f"[orchestrate] Schema validation failed step {idx} ({role}): {reason}"
+                    )
+                    engine.mark_step_failed(
+                        run_id, idx, reason=f"Output schema validation failed: {reason}"
+                    )
+                    _send_reply(
+                        hermes_config,
+                        f"⚠️ Schema validation failed for {role}: {reason}",
+                    )
+                    return
+
             pr_url = None
             if role == "deployer" and output_path:
                 pr_url = engine._extract_pr_url(output_path)
@@ -314,27 +321,18 @@ def _run_pipeline(
                 step_now = run_now["pipeline"][idx]
                 started = step_now.get("started_at", "")
                 completed = step_now.get("completed_at", "")
-                duration = (
-                    _format_duration(started, completed)
-                    if started and completed
-                    else "??"
-                )
+                duration = _format_duration(started, completed) if started and completed else "??"
                 pipeline = run_now["pipeline"]
                 next_roles = [
-                    s["role"]
-                    for s in pipeline[idx + 1 :]
-                    if s.get("status") == "pending"
+                    s["role"] for s in pipeline[idx + 1 :] if s.get("status") == "pending"
                 ]
                 next_label = next_roles[0] if next_roles else "done"
                 milestone_msg = (
-                    f"✓ {role} done ({duration}) — {run_now['project']}\n"
-                    f"Next: {next_label}"
+                    f"✓ {role} done ({duration}) — {run_now['project']}\nNext: {next_label}"
                 )
                 _send_reply(hermes_config, milestone_msg)
             except Exception as exc:
-                log.warning(
-                    f"[orchestrate] Failed to send milestone notification: {exc}"
-                )
+                log.warning(f"[orchestrate] Failed to send milestone notification: {exc}")
 
         else:
             # Auto-retry once for transient failures (failed / timeout).
@@ -359,8 +357,47 @@ def _run_pipeline(
             }
             reason = reason_map.get(final_status, final_status)
             engine.mark_step_failed(run_id, idx, reason=reason)
+
+            # On rate-limit: synthesize a handoff from the partial checkpoint via Ollama
+            # so work isn't lost and Jaiden can resume cleanly when quota resets.
+            handoff_path = ""
+            if final_status == "rate-limited":
+                try:
+                    output_note = engine._read_task_output_note(task_id)
+                    partial_output = ""
+                    if output_note:
+                        note_path = Path.home() / "Documents" / "RaphBrain" / output_note
+                        if note_path.exists():
+                            partial_output = note_path.read_text()
+                    handoff_path = write_handoff_via_ollama(
+                        task=run_snapshot.get("task_raw", ""),
+                        session_name=task_id,
+                        partial_output=partial_output,
+                    )
+                    # Mirror handoff to the project's agents/ folder so the next
+                    # fresh agent (on a new run) finds it during its RaphBrain scan.
+                    if handoff_path:
+                        project = run_snapshot.get("project", "")
+                        if project:
+                            proj_cap = project.capitalize()
+                            agents_dir = (
+                                Path.home()
+                                / "Documents"
+                                / "RaphBrain"
+                                / "Projects"
+                                / proj_cap
+                                / "agents"
+                            )
+                            agents_dir.mkdir(parents=True, exist_ok=True)
+                            mirror = agents_dir / f"hermes-rate-limited-{task_id}.md"
+                            mirror.write_text(Path(handoff_path).read_text())
+                            log.info(f"[orchestrate] Handoff mirrored to: {mirror}")
+                except Exception as exc:
+                    log.warning(f"[orchestrate] Ollama handoff failed: {exc}")
+
+            handoff_line = f"\nHandoff: {handoff_path}" if handoff_path else ""
             blocker_msg = (
-                f"⚠️ Blocked on {role}: {reason}\n\n"
+                f"⚠️ Blocked on {role}: {reason}{handoff_line}\n\n"
                 f"Reply with:\n"
                 f"[HERMES] abort — abort the run"
             )
@@ -384,9 +421,7 @@ def _run_pipeline(
                     run_id,
                     {
                         "status": final_status,
-                        "completed_at": datetime.utcnow().strftime(
-                            "%Y-%m-%dT%H:%M:%SZ"
-                        ),
+                        "completed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                     },
                 )
                 log.info(f"[orchestrate] Run {run_id} complete — status={final_status}")
@@ -430,9 +465,7 @@ def _run_pipeline(
             )
         except Exception:
             pass
-        _send_reply(
-            hermes_config, f"❌ Pipeline thread crashed for run {run_id}. Check logs."
-        )
+        _send_reply(hermes_config, f"❌ Pipeline thread crashed for run {run_id}. Check logs.")
         return
 
     # Send completion notification
@@ -445,12 +478,8 @@ def _run_pipeline(
         done_count = sum(1 for s in pipeline if s["status"] == "done")
         step_count = len(pipeline)
         started_at = run.get("created_at", "")
-        completed_at = run.get(
-            "completed_at", datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        )
-        total_duration = (
-            _format_duration(started_at, completed_at) if started_at else "??"
-        )
+        completed_at = run.get("completed_at", datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+        total_duration = _format_duration(started_at, completed_at) if started_at else "??"
         final_status = run["status"]
 
         if final_status == "done":
@@ -468,9 +497,7 @@ def _run_pipeline(
                     f"Steps: {done_count}/{step_count}"
                 )
         elif final_status == "failed":
-            failed_step = next(
-                (s["role"] for s in pipeline if s["status"] == "failed"), "unknown"
-            )
+            failed_step = next((s["role"] for s in pipeline if s["status"] == "failed"), "unknown")
             completion_msg = f"❌ {project} failed at step {failed_step}. Check logs."
         elif final_status == "aborted":
             completion_msg = (
@@ -478,9 +505,7 @@ def _run_pipeline(
                 f"Steps completed before abort: {done_count}/{step_count}"
             )
         else:
-            completion_msg = (
-                f"\U0001f3c1 {project} run ended with status: {final_status}"
-            )
+            completion_msg = f"\U0001f3c1 {project} run ended with status: {final_status}"
 
         _send_reply(hermes_config, completion_msg)
     except Exception as exc:
@@ -519,6 +544,11 @@ def orchestrate_task(task_text: str, config: dict) -> str:
         f"is_direct={result.is_direct} steps={len(result.pipeline)}"
     )
 
+    # Scaffold task — create project skeleton, return result synchronously
+    if result.scaffold_project:
+        log.info(f"[orchestrate] Scaffold task — project={result.scaffold_project!r}")
+        return run_scaffold(result.scaffold_project)
+
     # Direct task — use existing synchronous run_task()
     if result.is_direct:
         log.info("[orchestrate] Direct task — routing to run_task()")
@@ -554,9 +584,7 @@ def orchestrate_task(task_text: str, config: dict) -> str:
         name=f"hermes-pipeline-{run_id}",
     )
     t.start()
-    log.info(
-        f"[orchestrate] Pipeline thread started: run={run_id} project={result.project}"
-    )
+    log.info(f"[orchestrate] Pipeline thread started: run={run_id} project={result.project}")
 
     return start_msg
 
@@ -647,11 +675,7 @@ class TelegramPoller:
                 if not text:
                     continue
 
-                task = (
-                    text[len(self.prefix) :].strip()
-                    if text.startswith(self.prefix)
-                    else text
-                )
+                task = text[len(self.prefix) :].strip() if text.startswith(self.prefix) else text
                 log.info(f"Telegram task: {task[:80]}...")
                 try:
                     reply = orchestrate_task(task, self.hermes_cfg)
@@ -910,14 +934,10 @@ def main():
             time.sleep(config["trigger"]["email"]["poll_interval_seconds"])
 
     elif method == "file_watch":
-        log.info(
-            f"Trigger: file watch on {config['trigger']['file_watch']['watch_dir']}"
-        )
+        log.info(f"Trigger: file watch on {config['trigger']['file_watch']['watch_dir']}")
         observer = Observer()
         handler = FileWatcher(config)
-        observer.schedule(
-            handler, config["trigger"]["file_watch"]["watch_dir"], recursive=False
-        )
+        observer.schedule(handler, config["trigger"]["file_watch"]["watch_dir"], recursive=False)
         observer.start()
         try:
             while True:

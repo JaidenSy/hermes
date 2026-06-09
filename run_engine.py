@@ -42,12 +42,12 @@ except ImportError:
     from dataclasses import dataclass
     from typing import Optional as _Opt
 
-    @dataclass
+    @dataclass  # type: ignore[no-redef]
     class PipelineStep:
         role: str
         parallel_group: _Opt[int] = None
 
-    @dataclass
+    @dataclass  # type: ignore[no-redef]
     class PlannerResult:
         tier: int
         project: str
@@ -91,9 +91,7 @@ class RunEngine:
         """
         active = self.get_active_run()
         if active:
-            raise RuntimeError(
-                f"Run {active['id']!r} is already active — abort it first"
-            )
+            raise RuntimeError(f"Run {active['id']!r} is already active — abort it first")
 
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -192,9 +190,7 @@ class RunEngine:
                 run_id,
                 {
                     "status": final_status,
-                    "completed_at": datetime.now(timezone.utc).strftime(
-                        "%Y-%m-%dT%H:%M:%SZ"
-                    ),
+                    "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 },
             )
             log.info("Run %s complete — status=%s", run_id, final_status)
@@ -260,9 +256,7 @@ class RunEngine:
             run["pipeline"][step_index]["role"],
         )
 
-    def mark_step_failed(
-        self, run_id: str, step_index: int, reason: Optional[str] = None
-    ) -> None:
+    def mark_step_failed(self, run_id: str, step_index: int, reason: Optional[str] = None) -> None:
         """
         Sets pipeline[step_index].status=failed and run.status=failed.
         Stops pipeline advancement (caller must not call advance_pipeline after this).
@@ -566,9 +560,7 @@ class RunEngine:
             pr_url = None
             if step.get("role") == "deployer" and output_path:
                 pr_url = self._extract_pr_url(output_path)
-            self.mark_step_done(
-                run_id, step_index, output_path=output_path, pr_url=pr_url
-            )
+            self.mark_step_done(run_id, step_index, output_path=output_path, pr_url=pr_url)
 
         elif final_status in ("failed", "rate-limited", "timeout"):
             reason_map = {
@@ -589,9 +581,7 @@ class RunEngine:
                 step_index,
                 run_id,
             )
-            self.mark_step_failed(
-                run_id, step_index, reason=f"Unknown status: {final_status}"
-            )
+            self.mark_step_failed(run_id, step_index, reason=f"Unknown status: {final_status}")
 
     def _mark_step_running(self, run_id: str, step_index: int) -> None:
         """Sets pipeline[step_index].status=running, started_at=now."""
