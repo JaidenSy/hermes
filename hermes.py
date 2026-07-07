@@ -235,6 +235,13 @@ end tell"""
         log.info(f"iMessage sent to {reply_to}: {message[:80]}")
 
 
+def _redact_token(text: str, token: Optional[str]) -> str:
+    """Strip a bot token out of a string before it reaches the logs. requests
+    exceptions embed the full request URL (…/bot<TOKEN>/…), so logging a raw exc
+    leaks the token into hermes.log."""
+    return text.replace(token, "***") if token else text
+
+
 def _send_telegram(token: str, chat_id: int, message: str) -> None:
     """Send a message to a Telegram chat via Bot API."""
     try:
@@ -244,11 +251,11 @@ def _send_telegram(token: str, chat_id: int, message: str) -> None:
             timeout=10,
         )
         if not resp.ok:
-            log.error(f"Telegram send failed: {resp.text}")
+            log.error(f"Telegram send failed: {_redact_token(resp.text, token)}")
         else:
             log.info(f"Telegram message sent to {chat_id}: {message[:80]}")
     except Exception as exc:
-        log.error(f"Telegram send error: {exc}")
+        log.error(f"Telegram send error: {_redact_token(str(exc), token)}")
 
 
 def _send_reply(config: dict, message: str) -> None:
@@ -548,6 +555,42 @@ def orchestrate_task(task_text: str, config: dict) -> str:
                 return f"⚠️ Abort failed: {exc}"
         return "ℹ️ No active run to abort."
 
+    # Status shortcut — fast local read of run state. Must intercept before the
+    # planner, else "status" classifies as a direct task and spawns a 30-min
+    # Claude session that blocks the whole poll loop.
+    if task_text.strip().lower().rstrip("?") in (
+        "status",
+        "what's the status",
+        "whats the status",
+        "hermes status",
+    ):
+        engine = RunEngine()
+        active = engine.get_active_run()
+        if active:
+            steps = active.get("pipeline", [])
+            done = sum(1 for s in steps if s.get("status") == "done")
+            cur = next(
+                (s["role"] for s in steps if s.get("status") == "running"),
+                next((s["role"] for s in steps if s.get("status") == "pending"), "—"),
+            )
+            started = active.get("created_at") or ""
+            now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            elapsed = _format_duration(started, now) if started else "?"
+            return (
+                f"🟢 {active.get('project', '?')} [Tier {active.get('tier', '?')}] "
+                f"run {active['id']}\n"
+                f"Step: {cur} ({done}/{len(steps)} done) · {elapsed}\n"
+                f"Branch: {active.get('branch', '')}"
+            )
+        recent = engine.list_runs(limit=1)
+        if recent:
+            r = recent[0]
+            return (
+                f"⚪️ No active run.\n"
+                f"Last: {r.get('project', '?')} run {r.get('id', '?')} → {r.get('status', '?')}"
+            )
+        return "⚪️ No active run."
+
     result: PlannerResult = classify_task(task_text)
     log.info(
         f"[orchestrate] Classified: tier={result.tier} project={result.project!r} "
@@ -665,7 +708,7 @@ class TelegramPoller:
                 timeout=15,
             )
             if not resp.ok:
-                log.error(f"Telegram getUpdates failed: {resp.text}")
+                log.error(f"Telegram getUpdates failed: {_redact_token(resp.text, self.token)}")
                 return
 
             updates = resp.json().get("result", [])
@@ -695,7 +738,7 @@ class TelegramPoller:
                     self._reply(f"❌ Error: {task_exc}")
 
         except Exception as exc:
-            log.error(f"Telegram poll error: {exc}")
+            log.error(f"Telegram poll error: {_redact_token(str(exc), self.token)}")
 
     def _reply(self, message: str):
         _send_telegram(self.token, self.chat_id, message)
@@ -921,6 +964,9 @@ def main():
     method = config["trigger"]["method"]
 
     subprocess.run([str(Path.home() / "hermes" / "scripts" / "check-connectivity.sh")])
+
+    # Recover crash-orphaned runs ONCE here — never per-message (see RunEngine).
+    RunEngine().startup_recover_and_cleanup()
 
     if method == "telegram":
         log.info("Trigger: Telegram polling")

@@ -27,8 +27,36 @@ STEP_POLL_INTERVAL_S = 5  # poll raphael task JSON every 5 seconds
 STEP_TIMEOUT_S = 3600  # 60-min hard timeout per step
 RUN_FILE_LOCK_TIMEOUT_S = 5  # max wait to acquire file lock
 RUNS_RETENTION_DAYS = 7  # delete terminal runs older than this many days
+LEDGER_FILE = RUNS_DIR / "ledger.jsonl"  # append-only run outcomes, survives cleanup
 
 log = logging.getLogger("hermes")
+
+
+def _append_ledger(data: dict) -> None:
+    """Append one compact outcome line per run to LEDGER_FILE — the raw material
+    for any future routing/learning loop, kept even after the bulky run JSON is
+    pruned. Best-effort: never let ledger IO block cleanup."""
+    try:
+        with LEDGER_FILE.open("a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "id": data.get("id"),
+                        "project": data.get("project"),
+                        "tier": data.get("tier"),
+                        "status": data.get("status"),
+                        "created_at": data.get("created_at"),
+                        "completed_at": data.get("completed_at"),
+                        "pipeline": [
+                            {"role": s.get("role"), "status": s.get("status")}
+                            for s in data.get("pipeline", [])
+                        ],
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -74,9 +102,15 @@ class RunEngine:
 
     def __init__(self):
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        log.debug("RunEngine initialised — RUNS_DIR: %s", RUNS_DIR)
+
+    def startup_recover_and_cleanup(self) -> None:
+        """Run ONCE at daemon startup: abort runs orphaned by a crash and prune
+        aged-out run files. Deliberately NOT in __init__ — orchestrate_task builds
+        a fresh RunEngine() per incoming message, and running recovery there aborts
+        the run already in flight (the June-12 clobber race)."""
         self._recover_stale_runs()
         self._cleanup_old_runs()
-        log.debug("RunEngine initialised — RUNS_DIR: %s", RUNS_DIR)
 
     # ------------------------------------------------------------------
     # Public API
@@ -393,6 +427,7 @@ class RunEngine:
             timeout,
         )
 
+        session = f"raphael-{task_id}"
         while elapsed < timeout:
             time.sleep(STEP_POLL_INTERVAL_S)
             elapsed += STEP_POLL_INTERVAL_S
@@ -412,6 +447,30 @@ class RunEngine:
             except Exception:
                 # File may be mid-write or not yet created — retry next tick
                 pass
+
+            # Fast-fail: if the agent's tmux session has died without writing a
+            # terminal status, the agent crashed — don't wait out the 60-min
+            # timeout. Grace of one extra tick avoids a spawn-latency false read.
+            if elapsed > STEP_POLL_INTERVAL_S and (
+                subprocess.run(
+                    ["tmux", "has-session", "-t", session], capture_output=True
+                ).returncode
+                != 0
+            ):
+                try:  # re-read once in case the terminal write raced session exit
+                    status = json.loads(task_file.read_text()).get("status", "pending")
+                    if status in ("done", "failed", "needs-review", "rate-limited"):
+                        return status
+                except Exception:
+                    pass
+                log.warning(
+                    "Step agent session died: run=%s step=%d task_id=%s elapsed=%ds — failing fast",
+                    run_id,
+                    step_index,
+                    task_id,
+                    elapsed,
+                )
+                return "failed"
 
         log.warning(
             "Step timeout: run=%s step=%d task_id=%s elapsed=%ds",
@@ -437,6 +496,7 @@ class RunEngine:
                 data = json.loads(path.read_text())
                 if data.get("status") not in ("done", "failed", "aborted"):
                     continue
+                _append_ledger(data)  # preserve the outcome signal before deleting
                 path.unlink()
                 deleted += 1
                 log.debug("Cleanup: deleted old run %s (%s)", data.get("id"), path.name)
