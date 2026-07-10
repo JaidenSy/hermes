@@ -162,8 +162,10 @@ def run_task(
     log.info(f"Task: {task[:120]}...")
 
     task_file = Path.home() / "hermes" / "tasks" / f"{session_name}.md"
+    task_file.parent.mkdir(parents=True, exist_ok=True)
     task_file.write_text(f"# Hermes Task\n\n{task}\n")
     log_file = Path.home() / "hermes" / "logs" / f"{session_name}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Direct tasks default to sonnet — the classifier sometimes routes real work
     # here, and the cheapest model bounces on anything non-trivial.
@@ -227,6 +229,37 @@ def run_task(
 # ---------------------------------------------------------------------------
 # Pipeline orchestration helpers
 # ---------------------------------------------------------------------------
+
+RAPHBRAIN_DAILY_DIR = Path.home() / "Documents" / "RaphBrain" / "Daily"
+
+
+def _append_pipeline_to_daily_note(
+    project: str, branch: str, final_status: str, duration: str, failed_step: str = ""
+) -> None:
+    """Append a one-liner pipeline result to today's RaphBrain daily note."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        daily_path = RAPHBRAIN_DAILY_DIR / f"{today}.md"
+
+        if final_status == "done":
+            line = f"\n- ✅ Hermes: `{project}/{branch}` done in {duration}"
+        elif final_status == "failed":
+            line = f"\n- ❌ Hermes: `{project}` failed at `{failed_step}` ({duration})"
+        elif final_status == "aborted":
+            line = f"\n- 🛑 Hermes: `{project}/{branch}` aborted ({duration})"
+        else:
+            return  # don't log unknown states
+
+        if daily_path.exists():
+            with daily_path.open("a") as f:
+                f.write(line)
+        else:
+            daily_path.parent.mkdir(parents=True, exist_ok=True)
+            daily_path.write_text(f"# {today}\n{line}\n")
+
+        log.info(f"[daily-note] Appended pipeline result to {daily_path.name}")
+    except Exception as exc:
+        log.warning(f"[daily-note] Failed to write to daily note: {exc}")
 
 
 def _format_duration(started_iso: str, ended_iso: str) -> str:
@@ -554,6 +587,12 @@ def _run_pipeline(run_id: str, engine: RunEngine, runner: AgentRunner, hermes_co
             completion_msg = f"\U0001f3c1 {project} run ended with status: {final_status}"
 
         _send_reply(hermes_config, completion_msg)
+
+        # Append a one-liner to today's RaphBrain daily note.
+        failed_step = ""
+        if final_status == "failed":
+            failed_step = next((s["role"] for s in pipeline if s["status"] == "failed"), "unknown")
+        _append_pipeline_to_daily_note(project, branch, final_status, total_duration, failed_step)
     except Exception as exc:
         log.error(f"[orchestrate] Failed to send completion notification: {exc}")
 
