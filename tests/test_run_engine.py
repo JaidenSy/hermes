@@ -21,9 +21,7 @@ HERMES_DIR = Path.home() / "hermes"
 sys.path.insert(0, str(HERMES_DIR))
 
 
-def _make_planner_result(
-    tier=2, project="hermes", branch="feature/test", pipeline_steps=None
-):
+def _make_planner_result(tier=2, project="hermes", branch="feature/test", pipeline_steps=None):
     """Build a minimal PlannerResult-like object for testing."""
     from planner import PipelineStep, PlannerResult
 
@@ -66,7 +64,12 @@ class TestRunEngineWithTempDir(unittest.TestCase):
         self._tmpdir.cleanup()
 
     def _engine(self):
-        return self.RunEngine()
+        # Represents the engine as it exists after daemon startup: recovery +
+        # cleanup have run. Per-message construction is exercised via the bare
+        # self.RunEngine() constructor (see test_construction_does_not_abort_running_run).
+        eng = self.RunEngine()
+        eng.startup_recover_and_cleanup()
+        return eng
 
     # ------------------------------------------------------------------
     # create_run
@@ -164,14 +167,10 @@ class TestRunEngineWithTempDir(unittest.TestCase):
         run_id = run["id"]
 
         engine.mark_step_started(run_id, 0, "task-deployer-001")
-        engine.mark_step_done(
-            run_id, 0, pr_url="https://github.com/JaidenSy/hermes/pull/42"
-        )
+        engine.mark_step_done(run_id, 0, pr_url="https://github.com/JaidenSy/hermes/pull/42")
 
         updated = engine.get_run(run_id)
-        self.assertEqual(
-            updated["pr_url"], "https://github.com/JaidenSy/hermes/pull/42"
-        )
+        self.assertEqual(updated["pr_url"], "https://github.com/JaidenSy/hermes/pull/42")
 
     # ------------------------------------------------------------------
     # mark_step_failed
@@ -234,9 +233,7 @@ class TestRunEngineWithTempDir(unittest.TestCase):
         # Should have called tmux kill-session for the running step
         call_args_list = mock_sub.call_args_list
         tmux_calls = [c for c in call_args_list if c[0][0][0] == "tmux"]
-        self.assertTrue(
-            len(tmux_calls) >= 1, "Expected at least one tmux kill-session call"
-        )
+        self.assertTrue(len(tmux_calls) >= 1, "Expected at least one tmux kill-session call")
 
     # ------------------------------------------------------------------
     # get_active_run
@@ -439,6 +436,24 @@ class TestRunEngineWithTempDir(unittest.TestCase):
         for step in updated["pipeline"]:
             self.assertEqual(step["status"], "skipped")
 
+    def test_construction_does_not_abort_running_run(self):
+        """Regression (June-12 clobber race): orchestrate_task builds a fresh
+        RunEngine() per incoming message. Bare construction must NOT abort the run
+        already in flight — recovery only runs via startup_recover_and_cleanup()."""
+        run_data = {
+            "id": "live001",
+            "status": "running",
+            "completed_at": None,
+            "pipeline": [{"role": "coder", "status": "running", "task_id": "t-1"}],
+        }
+        self._write_raw_run(run_data)
+
+        self.RunEngine()  # exactly what a second [HERMES] message triggers mid-run
+
+        updated = json.loads((list(self.tmp_path.glob("*live001*"))[0]).read_text())
+        self.assertEqual(updated["status"], "running")
+        self.assertEqual(updated["pipeline"][0]["status"], "running")
+
     def test_recover_terminal_run_is_left_untouched(self):
         """Runs in terminal states (done, failed, aborted) are not modified."""
         for terminal_status in ("done", "failed", "aborted"):
@@ -456,9 +471,7 @@ class TestRunEngineWithTempDir(unittest.TestCase):
 
         for terminal_status in ("done", "failed", "aborted"):
             run_id = f"terminal-{terminal_status}"
-            matches = [
-                p for p in self.tmp_path.glob("*.json") if f"-{run_id}" in p.name
-            ]
+            matches = [p for p in self.tmp_path.glob("*.json") if f"-{run_id}" in p.name]
             self.assertEqual(len(matches), 1)
             on_disk = json.loads(matches[0].read_text())
             self.assertEqual(
@@ -560,9 +573,7 @@ class TestRunEngineWithTempDir(unittest.TestCase):
         engine = self._engine()
 
         remaining = list(self.tmp_path.glob("*.json"))
-        self.assertEqual(
-            len(remaining), 0, "Old terminal runs should have been deleted"
-        )
+        self.assertEqual(len(remaining), 0, "Old terminal runs should have been deleted")
 
     def test_cleanup_keeps_recent_terminal_runs(self):
         """Terminal runs younger than RUNS_RETENTION_DAYS are kept."""
@@ -599,9 +610,7 @@ class TestRunEngineWithTempDir(unittest.TestCase):
 
         # After recovery they'll be aborted but mtime updated to now, so should survive
         remaining = list(self.tmp_path.glob("*.json"))
-        self.assertEqual(
-            len(remaining), 2, "Recovered active runs should not be deleted"
-        )
+        self.assertEqual(len(remaining), 2, "Recovered active runs should not be deleted")
 
 
 if __name__ == "__main__":
