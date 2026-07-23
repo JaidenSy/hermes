@@ -1101,6 +1101,14 @@ def orchestrate_task(task_text: str, config: dict) -> str:
         _cmd.startswith("resume ") and _cmd[len("resume ") :].lstrip()[:1].isdigit()
     ):
         return _resume_handoff(_cmd[len("resume") :].strip(), config)
+    # Self-scheduler. Task text (after `|`) keeps its original case, so read from
+    # task_text, not the lowercased _cmd.
+    if _cmd in ("schedules", "list schedules"):
+        return scheduler.list_schedules()
+    if _cmd.startswith("unschedule "):
+        return scheduler.remove_schedule(_cmd[len("unschedule ") :])
+    if _cmd == "schedule" or _cmd.startswith("schedule "):
+        return scheduler.add_schedule(task_text.strip()[len("schedule") :].strip())
     if _cmd in ("help", "commands", "menu"):
         return (
             "Engram commands:\n"
@@ -1110,6 +1118,8 @@ def orchestrate_task(task_text: str, config: dict) -> str:
             "• abort — cancel the active run\n"
             "• handoffs — list unfinished runs you can resume\n"
             "• resume <n> — pick up handoff #n where it stopped (add a project to override, e.g. `resume 2 alphabot`)\n"
+            "• schedule <when> | <task> — self-run later/recurring (e.g. `schedule daily 09:00 | on alphabot, morning check`)\n"
+            "• schedules / unschedule <n> — list / remove schedules\n"
             "• projects — list known projects"
         )
 
@@ -1300,6 +1310,21 @@ def main():
     # Probe model aliases so routing auto-downgrades if a tier (e.g. Fable) has left
     # the plan — a run must never die on a model the CLI can no longer reach.
     probe_models()
+
+    # Self-scheduler: fires due schedules by self-injecting them through the same
+    # orchestrate_task entry a Telegram message uses, then texts Jaiden the result.
+    def _dispatch_scheduled(task_text: str) -> None:
+        def _run():
+            try:
+                reply = orchestrate_task(task_text, config)
+            except Exception as exc:
+                log.error(f"[scheduler] task failed: {exc}", exc_info=True)
+                reply = f"❌ {exc}"
+            _send_reply(config, f"⏰ Scheduled — {reply[:3900]}")
+
+        threading.Thread(target=_run, daemon=True, name="engram-sched-task").start()
+
+    scheduler.Scheduler(_dispatch_scheduled).start()
 
     log.info("Trigger: Telegram polling")
     poller = TelegramPoller(config)
