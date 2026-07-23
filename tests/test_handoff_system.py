@@ -88,6 +88,25 @@ class TestHandoffSystem(unittest.TestCase):
         self._write("t1")
         self.assertIn("matches", hermes._resume_handoff("9", {}))
 
+    def test_out_of_range_index_never_substring_matches_a_stem(self):
+        # stems embed unix timestamps; `resume 9` (out of range) must error, NOT
+        # substring-match "9" in a timestamp and resume/archive the wrong handoff.
+        (self._dir / "hermes-1753000009-handoff.md").write_text(
+            '<!-- hermes-meta project="demo" -->\n# h\n> **Original task:** t\n'
+        )
+        with (
+            patch.object(hermes, "run_task") as rt,
+            patch.object(hermes, "resolve_project", return_value=_FakeProj()),
+        ):
+            out = hermes._resume_handoff("9", {})
+        rt.assert_not_called()
+        self.assertIn("matches", out)
+        self.assertTrue((self._dir / "hermes-1753000009-handoff.md").exists())  # not archived
+
+    def test_resume_bare_lists_pending(self):
+        self._write("t1")
+        self.assertIn("Pending handoffs", hermes._resume_handoff("", {}))
+
     def test_resume_unresolvable_project_does_not_dispatch(self):
         self._write("t1", project="")  # legacy, no marker
         with (

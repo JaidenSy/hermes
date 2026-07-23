@@ -166,7 +166,10 @@ def _list_handoffs() -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = ["Pending handoffs — `resume <n>` to pick up, `handoffs clear` to dismiss all:"]
     for i, p in enumerate(pend, 1):
-        meta = _parse_handoff_meta(p.read_text())
+        try:
+            meta = _parse_handoff_meta(p.read_text())
+        except OSError:
+            meta = {"project": "?", "task": "(unreadable)"}
         mtime = datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
@@ -195,8 +198,8 @@ def _clear_handoffs() -> str:
 def _resume_handoff(arg: str, config: dict) -> str:
     """Resume a pending handoff: seed a fresh agent with it in the right repo,
     then archive the handoff (a new failure writes a fresh one, so the pending
-    list always reflects reality). `arg` = an index into the pending list or a
-    filename substring, with an optional trailing project override (`2 alphabot`)."""
+    list always reflects reality). `arg` = an index into the pending list (empty →
+    just list them), with an optional trailing project override (`2 alphabot`)."""
     pend = _pending_handoffs()
     if not pend:
         return "✅ No pending handoffs to resume. Send `handoffs` to check."
@@ -205,15 +208,24 @@ def _resume_handoff(arg: str, config: dict) -> str:
     sel = parts[0] if parts else ""
     override = parts[1] if len(parts) > 1 else ""
 
-    chosen = None
-    if sel.isdigit() and 1 <= int(sel) <= len(pend):
-        chosen = pend[int(sel) - 1]
-    elif sel:
+    if not sel:  # bare `resume` → just show the list to pick from
+        return _list_handoffs()
+
+    # A numeric selector is ONLY an index — an out-of-range number must fail, never
+    # fall through to a substring match (stems embed unix timestamps full of digits,
+    # so `resume 9` would silently match and resume the WRONG handoff).
+    if sel.isdigit():
+        i = int(sel)
+        chosen = pend[i - 1] if 1 <= i <= len(pend) else None
+    else:
         chosen = next((p for p in pend if sel in p.stem), None)
     if chosen is None:
         return f"❓ No pending handoff matches {sel!r}. Send `handoffs` to list them."
 
-    text = chosen.read_text()
+    try:
+        text = chosen.read_text()
+    except OSError as exc:
+        return f"❓ Couldn't read handoff `{chosen.stem}`: {exc}"
     meta = _parse_handoff_meta(text)
     project = override or meta["project"]
     if not project and meta["task"]:
@@ -852,7 +864,12 @@ def orchestrate_task(task_text: str, config: dict) -> str:
         return _list_handoffs()
     if _cmd in ("handoffs clear", "clear handoffs"):
         return _clear_handoffs()
-    if _cmd == "resume" or _cmd.startswith("resume "):
+    # Only intercept `resume` (bare → list) or `resume <n> [project]` — NOT a natural
+    # task that merely starts with the word ("resume the deploy refactor"), which must
+    # still route to the planner.
+    if _cmd == "resume" or (
+        _cmd.startswith("resume ") and _cmd[len("resume ") :].lstrip()[:1].isdigit()
+    ):
         return _resume_handoff(_cmd[len("resume") :].strip(), config)
     if _cmd in ("help", "commands", "menu"):
         return (
