@@ -6,6 +6,7 @@ Listens for commands, spawns Claude Code sessions via tmux, reports back.
 
 import subprocess
 import logging
+import re
 import time
 import threading
 import yaml
@@ -65,8 +66,10 @@ def _ollama_generate(prompt: str, timeout: int = 120, model: str = "llama3.1:8b"
     except TimeoutError:
         log.error(f"Ollama generate timed out after {timeout}s")
         return ""
-    except OSError:
-        log.error("Ollama not reachable — is it running?")
+    except (OSError, ValueError) as exc:
+        # OSError covers connect-refused AND HTTPError (e.g. model not pulled);
+        # ValueError covers a non-JSON body. Honor the "" -on-any-failure contract.
+        log.error(f"Ollama generate failed: {exc}")
         return ""
 
 
@@ -310,23 +313,38 @@ HERMES_RUN_LOG_HEADER = "## Hermes Run Log"
 SKILL_CANDIDATES_DIR = Path.home() / "hermes" / "skill-candidates"
 
 
+_PROGRESS_LOCK = threading.Lock()
+_RUN_LOG_HEADER_RE = re.compile(r"(?m)^" + re.escape(HERMES_RUN_LOG_HEADER) + r"$")
+
+
 def _prepend_under_runlog(project: str, entry: str) -> None:
     """Insert `entry` newest-first under the '## Hermes Run Log' header in the
     project's Progress.md, creating the file + section if missing. Shared by the
-    deterministic run-note and the post-task learnings writer."""
-    proj_cap = project.capitalize()
-    progress_path = RAPHBRAIN_PROJECTS_DIR / proj_cap / "Progress.md"
-    if progress_path.exists():
-        content = progress_path.read_text()
-        if HERMES_RUN_LOG_HEADER + "\n" in content:
-            head, _, rest = content.partition(HERMES_RUN_LOG_HEADER + "\n")
-            content = head + HERMES_RUN_LOG_HEADER + "\n" + entry + "\n" + rest
+    deterministic run-note and the post-task learnings writer.
+
+    Held under a lock: a slow post-task-review thread and the next run's
+    deterministic write can hit the same file's read-modify-write at once, and the
+    loser would silently clobber the other — including the deterministic guarantee."""
+    # Registry is the source of truth for the vault folder — capitalize() misroutes
+    # hyphenated projects (finance-tracker → a Finance-tracker orphan nothing reads).
+    proj = resolve_project(project)
+    dir_name = (proj.raphbrain_dir if proj else None) or project.capitalize()
+    progress_path = RAPHBRAIN_PROJECTS_DIR / dir_name / "Progress.md"
+    with _PROGRESS_LOCK:
+        if progress_path.exists():
+            content = progress_path.read_text(encoding="utf-8")
+            m = _RUN_LOG_HEADER_RE.search(content)  # line-anchored — not any prose match
+            if m:
+                cut = m.end() + (1 if content[m.end() : m.end() + 1] == "\n" else 0)
+                content = content[:cut] + entry + "\n" + content[cut:]
+            else:
+                content = content.rstrip() + f"\n\n{HERMES_RUN_LOG_HEADER}\n{entry}"
+            progress_path.write_text(content, encoding="utf-8")
         else:
-            content = content.rstrip() + f"\n\n{HERMES_RUN_LOG_HEADER}\n{entry}"
-        progress_path.write_text(content)
-    else:
-        progress_path.parent.mkdir(parents=True, exist_ok=True)
-        progress_path.write_text(f"# {proj_cap} — Progress\n\n{HERMES_RUN_LOG_HEADER}\n{entry}")
+            progress_path.parent.mkdir(parents=True, exist_ok=True)
+            progress_path.write_text(
+                f"# {dir_name} — Progress\n\n{HERMES_RUN_LOG_HEADER}\n{entry}", encoding="utf-8"
+            )
 
 
 def _append_pipeline_to_progress_note(
@@ -376,8 +394,8 @@ Respond with EXACTLY these two sections and nothing else:
 2-4 short bullets: what worked, and any gotcha worth remembering. Specific and factual.
 
 ## Skill Candidate
-Only if this run followed a genuinely reusable, repeatable procedure worth reusing on future tasks. If it was one-off or too project-specific, write exactly: NO_SKILL
-If reusable, output ONLY a skill in this exact format:
+DEFAULT TO NO_SKILL. Propose a skill ONLY if this run followed a genuinely reusable, repeatable procedure you would run again on a DIFFERENT project. One-off, project-specific, or "just did the task" work is NOT a skill — when in doubt, write exactly: NO_SKILL
+If (and only if) it is truly reusable, output ONLY a skill in this exact format:
 ---
 name: <kebab-case-name>
 description: <one line under 60 chars>
@@ -387,23 +405,31 @@ description: <one line under 60 chars>
 
 
 def _split_review(text: str) -> tuple[str, str]:
-    """Split an Ollama review into (learnings, skill_candidate). skill is "" when the
-    model wrote NO_SKILL or omitted the section."""
+    """Split an Ollama review into (learnings, skill_candidate). skill is "" unless the
+    section actually parses as a frontmatter skill — a paraphrased "No skill needed"
+    or plain prose must NOT stage a candidate (the model rarely emits the literal
+    NO_SKILL token, so the gate is 'looks like a skill', not 'absence of NO_SKILL')."""
     skill = ""
     pre = text
     if "## Skill Candidate" in text:
         pre, _, post = text.partition("## Skill Candidate")
-        if "NO_SKILL" not in post.upper():
-            skill = post.strip()
+        post = post.strip()
+        if post.startswith("---") and "NO_SKILL" not in post.upper():
+            skill = post
     learnings = pre.split("## Learnings", 1)[1].strip() if "## Learnings" in pre else pre.strip()
     return learnings, skill
 
 
 def _skill_name(skill_md: str) -> str:
-    """Pull the kebab `name:` out of a skill candidate's frontmatter, else ""."""
+    """Pull the kebab `name:` from a skill candidate's frontmatter, sanitized to a safe
+    bare filename ("" if none). Sanitizing is load-bearing security, not cosmetics: the
+    name comes from an 8B model fed agent notes, and it becomes a path — an unsanitized
+    `../../.claude/skills/x` or absolute path would escape the staging dir into the
+    globally-active skills folder, defeating the whole review gate."""
     for line in skill_md.splitlines():
         if line.strip().startswith("name:"):
-            return line.split("name:", 1)[1].strip().strip("\"'")
+            raw = line.split("name:", 1)[1].strip().strip("\"'")
+            return re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")[:60]
     return ""
 
 
@@ -425,7 +451,9 @@ def spawn_post_task_review(engine, run_id: str, project: str, branch: str, herme
                     continue
                 note_path = Path.home() / "Documents" / "RaphBrain" / op
                 if note_path.exists():
-                    notes.append(f"### {step.get('role')}\n{note_path.read_text()[:1500]}")
+                    notes.append(
+                        f"### {step.get('role')}\n{note_path.read_text(encoding='utf-8')[:1500]}"
+                    )
             context = ("\n\n".join(notes))[:6000] or "(no step notes captured)"
             out = _ollama_generate(
                 _POST_TASK_REVIEW_PROMPT.format(
@@ -440,15 +468,21 @@ def spawn_post_task_review(engine, run_id: str, project: str, branch: str, herme
                 stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
                 _prepend_under_runlog(project, f"#### {stamp} — 🧠 Learnings\n{learnings}\n")
             candidate_path = ""
-            if skill:
+            # Stage ONLY a candidate that parses as a real skill with a safe name — no
+            # timestamp fallback. A nameless/prose blob is not a skill, so it never
+            # stages a garbage file or pings Jaiden on a plain successful run.
+            name = _skill_name(skill) if skill else ""
+            if skill and skill.startswith("---") and name:
                 SKILL_CANDIDATES_DIR.mkdir(parents=True, exist_ok=True)
-                name = _skill_name(skill) or f"{project}-{datetime.now().strftime('%Y%m%d-%H%M')}"
-                candidate_path = str(SKILL_CANDIDATES_DIR / f"{name}.md")
-                Path(candidate_path).write_text(skill + "\n")
-                _send_reply(
-                    hermes_config,
-                    f"🧠 {project}: drafted a skill candidate — review to promote:\n{candidate_path}",
-                )
+                candidate = SKILL_CANDIDATES_DIR / f"{name}.md"
+                # Extra belt: the resolved path must stay inside the staging dir.
+                if candidate.resolve().parent == SKILL_CANDIDATES_DIR.resolve():
+                    candidate.write_text(skill + "\n", encoding="utf-8")
+                    candidate_path = str(candidate)
+                    _send_reply(
+                        hermes_config,
+                        f"🧠 {project}: drafted a skill candidate — review to promote:\n{candidate_path}",
+                    )
             log.info(
                 f"[post-task-review] {project}: learnings={'y' if learnings else 'n'} "
                 f"skill_candidate={'y' if candidate_path else 'n'}"
